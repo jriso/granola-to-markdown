@@ -15,7 +15,7 @@ import sys
 from datetime import datetime
 
 DEFAULT_CACHE_PATH = os.path.expanduser(
-    "~/Library/Application Support/Granola/cache-v3.json"
+    "~/Library/Application Support/Granola/cache-v4.json"
 )
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
@@ -324,8 +324,10 @@ def load_cache(cache_path):
     with open(cache_path, "r") as f:
         raw = json.load(f)
 
-    parsed = json.loads(raw["cache"])
-    return parsed["state"]
+    cache_data = raw["cache"]
+    if isinstance(cache_data, str):
+        cache_data = json.loads(cache_data)
+    return cache_data["state"]
 
 
 def load_sync_state(output_dir):
@@ -360,7 +362,7 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False):
     doc_lists = state.get("documentLists", {})
     doc_folders = {}
     for list_id, doc_ids in doc_lists.items():
-        name = doc_lists_meta.get(list_id, {}).get("name")
+        name = doc_lists_meta.get(list_id, {}).get("title")
         if name:
             for did in doc_ids:
                 doc_folders.setdefault(did, []).append(name)

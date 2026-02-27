@@ -18,7 +18,7 @@ After running `install.sh`, Claude Code has access to Granola meetings via MCP t
 | `export_meeting` | Export a meeting as markdown |
 | `analyze_patterns` | Analyze meeting patterns over time |
 
-Data source: Local Granola cache at `~/Library/Application Support/Granola/cache-v3.json`. No API key needed.
+Data source: Local Granola cache at `~/Library/Application Support/Granola/cache-v4.json`. No API key needed.
 
 ## Sync Script
 
