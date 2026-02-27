@@ -15,7 +15,7 @@ import sys
 from datetime import datetime
 
 DEFAULT_CACHE_PATH = os.path.expanduser(
-    "~/Library/Application Support/Granola/cache-v3.json"
+    "~/Library/Application Support/Granola/cache-v4.json"
 )
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
@@ -151,7 +151,7 @@ def get_attendee_name(attendee):
     return attendee.get("email", "Unknown")
 
 
-def extract_meeting_data(doc, panels):
+def extract_meeting_data(doc, panels, folders=None):
     """Extract structured meeting data from a Granola document."""
     doc_id = doc["id"]
     title = doc.get("title", "Untitled Meeting")
@@ -214,6 +214,7 @@ def extract_meeting_data(doc, panels):
         "time": time_str,
         "duration_minutes": duration_minutes,
         "attendees": attendees,
+        "folders": folders or [],
         "notes": notes_md,
         "summary": summary_md,
         "updated_at": doc.get("updated_at", ""),
@@ -287,6 +288,10 @@ def build_markdown(data):
         for att in data["attendees"]:
             lines.append(f"  - name: {yaml_escape(att['name'])}")
             lines.append(f"    email: {att['email']}")
+    if data["folders"]:
+        lines.append("folders:")
+        for folder in data["folders"]:
+            lines.append(f"  - {yaml_escape(folder)}")
     lines.append("type: meeting")
     lines.append(f"granola_id: {data['id']}")
     lines.append(f'updated_at: "{data["updated_at"]}"')
@@ -319,8 +324,10 @@ def load_cache(cache_path):
     with open(cache_path, "r") as f:
         raw = json.load(f)
 
-    parsed = json.loads(raw["cache"])
-    return parsed["state"]
+    cache_data = raw["cache"]
+    if isinstance(cache_data, str):
+        cache_data = json.loads(cache_data)
+    return cache_data["state"]
 
 
 def load_sync_state(output_dir):
@@ -350,6 +357,18 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False):
     panels = state.get("documentPanels", {})
     transcripts = state.get("transcripts", {})
 
+    # Build reverse lookup: document_id -> [folder_name, ...]
+    doc_lists_meta = state.get("documentListsMetadata", {})
+    doc_lists = state.get("documentLists", {})
+    doc_folders = {}
+    for list_id, doc_ids in doc_lists.items():
+        name = doc_lists_meta.get(list_id, {}).get("title")
+        if name:
+            for did in doc_ids:
+                doc_folders.setdefault(did, []).append(name)
+    for did in doc_folders:
+        doc_folders[did].sort()
+
     log(f"Found {len(documents)} documents, {len(transcripts)} transcripts")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -362,7 +381,7 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False):
         if doc.get("deleted_at") or doc.get("was_trashed"):
             log(f"  Skipping deleted: {doc.get('title', doc_id)}")
             continue
-        data = extract_meeting_data(doc, panels)
+        data = extract_meeting_data(doc, panels, folders=doc_folders.get(doc_id))
         all_data[doc_id] = data
 
     # Assign filenames (detect collisions)

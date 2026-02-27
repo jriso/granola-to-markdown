@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_INSTALL_DIR="$HOME/.local/share/granola-mcp"
 MCP_CONFIG="$HOME/.mcp.json"
-GRANOLA_CACHE="$HOME/Library/Application Support/Granola/cache-v3.json"
+GRANOLA_CACHE="$HOME/Library/Application Support/Granola/cache-v4.json"
 LAUNCHD_LABEL="com.granola-to-markdown.sync"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 
@@ -158,7 +158,7 @@ import sys
 
 mcp_path = os.path.expanduser("~/.mcp.json")
 install_dir = os.path.expanduser("~/.local/share/granola-mcp")
-cache_path = os.path.expanduser("~/Library/Application Support/Granola/cache-v3.json")
+cache_path = os.path.expanduser("~/Library/Application Support/Granola/cache-v4.json")
 
 # Load existing config or start fresh
 config = {"mcpServers": {}}
