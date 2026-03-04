@@ -8,10 +8,12 @@ Stdlib only — no external dependencies.
 """
 
 import argparse
+import gzip
 import json
 import os
 import re
 import sys
+import urllib.request
 from datetime import datetime
 
 DEFAULT_CACHE_PATH = os.path.expanduser(
@@ -151,7 +153,7 @@ def get_attendee_name(attendee):
     return attendee.get("email", "Unknown")
 
 
-def extract_meeting_data(doc, panels, folders=None):
+def extract_meeting_data(doc, panels, folders=None, api_panel=None):
     """Extract structured meeting data from a Granola document."""
     doc_id = doc["id"]
     title = doc.get("title", "Untitled Meeting")
@@ -206,6 +208,10 @@ def extract_meeting_data(doc, panels, folders=None):
         html = panel.get("original_content", "")
         if html and not summary_md:
             summary_md = html_to_basic_markdown(html)
+
+    # Fallback: use panel from API response
+    if not summary_md and api_panel:
+        summary_md = tiptap_to_markdown(api_panel).strip()
 
     return {
         "id": doc_id,
@@ -330,6 +336,75 @@ def load_cache(cache_path):
     return cache_data["state"]
 
 
+def load_api_token():
+    """Load the Granola API access token from supabase.json.
+
+    Returns None if the file is missing or malformed.
+    """
+    path = os.path.expanduser(
+        "~/Library/Application Support/Granola/supabase.json"
+    )
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        workos = data.get("workos_tokens")
+        if isinstance(workos, str):
+            workos = json.loads(workos)
+        return workos.get("access_token") if workos else None
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def fetch_api_panels(token, doc_ids):
+    """Fetch summary panels from the Granola API.
+
+    Returns a dict mapping doc_id -> Tiptap content dict.
+    Returns an empty dict on any error.
+    """
+    if not doc_ids:
+        return {}
+
+    result = {}
+    batch_size = 100
+
+    for i in range(0, len(doc_ids), batch_size):
+        batch = doc_ids[i : i + batch_size]
+        payload = json.dumps({
+            "filter_document_ids": batch,
+            "include_last_viewed_panel": True,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.granola.ai/v2/get-documents",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                body = json.loads(raw)
+
+            # API returns {"docs": [...]} or a flat list
+            docs = body.get("docs", body) if isinstance(body, dict) else body
+
+            for doc in docs:
+                panel = doc.get("last_viewed_panel")
+                if panel and panel.get("content"):
+                    result[doc["id"]] = panel["content"]
+        except Exception:
+            continue
+
+    return result
+
+
 def load_sync_state(output_dir):
     """Load the sync state tracking file."""
     state_path = os.path.join(output_dir, STATE_FILE)
@@ -346,7 +421,7 @@ def save_sync_state(output_dir, state):
         json.dump(state, f, indent=2)
 
 
-def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False):
+def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_api=False):
     """Main sync function."""
     log = lambda msg: print(msg) if verbose else None
 
@@ -356,6 +431,18 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False):
     documents = state.get("documents", {})
     panels = state.get("documentPanels", {})
     transcripts = state.get("transcripts", {})
+
+    # Fetch panels from API if cache has none
+    api_panels = {}
+    if not panels and not no_api:
+        token = load_api_token()
+        if token:
+            log("Cache has no documentPanels, fetching from API...")
+            doc_ids = [d for d in documents if not documents[d].get("deleted_at")]
+            api_panels = fetch_api_panels(token, doc_ids)
+            log(f"  Fetched {len(api_panels)} panels from API")
+        else:
+            log("No API token found, skipping summary fetch")
 
     # Build reverse lookup: document_id -> [folder_name, ...]
     doc_lists_meta = state.get("documentListsMetadata", {})
@@ -381,7 +468,11 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False):
         if doc.get("deleted_at") or doc.get("was_trashed"):
             log(f"  Skipping deleted: {doc.get('title', doc_id)}")
             continue
-        data = extract_meeting_data(doc, panels, folders=doc_folders.get(doc_id))
+        data = extract_meeting_data(
+            doc, panels,
+            folders=doc_folders.get(doc_id),
+            api_panel=api_panels.get(doc_id),
+        )
         all_data[doc_id] = data
 
     # Assign filenames (detect collisions)
@@ -557,6 +648,11 @@ def main():
         action="store_true",
         help="Print detailed progress",
     )
+    parser.add_argument(
+        "--no-api",
+        action="store_true",
+        help="Skip API calls, use cache only",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.cache_path):
@@ -569,6 +665,7 @@ def main():
         force=args.force,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        no_api=args.no_api,
     )
 
 
