@@ -355,6 +355,65 @@ def load_api_token():
         return None
 
 
+def _api_get_documents(token, doc_ids=None):
+    """Fetch documents from the Granola API.
+
+    If doc_ids is provided, fetches those specific documents.
+    Otherwise fetches all documents.
+
+    Returns the list of document dicts from the API.
+    """
+    payload_dict = {"include_last_viewed_panel": True}
+    if doc_ids:
+        payload_dict["filter_document_ids"] = doc_ids
+    payload = json.dumps(payload_dict).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.granola.ai/v2/get-documents",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        body = json.loads(raw)
+
+    return body.get("docs", body) if isinstance(body, dict) else body
+
+
+def fetch_api_documents(token):
+    """Fetch all documents from the Granola API.
+
+    Returns a tuple (documents_dict, api_panels_dict) where:
+    - documents_dict maps doc_id -> document dict (matching cache format)
+    - api_panels_dict maps doc_id -> Tiptap content dict
+    """
+    documents = {}
+    api_panels = {}
+
+    try:
+        docs = _api_get_documents(token)
+        for doc in docs:
+            doc_id = doc.get("id")
+            if not doc_id:
+                continue
+            documents[doc_id] = doc
+            panel = doc.get("last_viewed_panel")
+            if panel and panel.get("content"):
+                api_panels[doc_id] = panel["content"]
+    except Exception as e:
+        print(f"  Warning: API fetch failed: {e}", file=sys.stderr)
+
+    return documents, api_panels
+
+
 def fetch_api_panels(token, doc_ids):
     """Fetch summary panels from the Granola API.
 
@@ -369,32 +428,8 @@ def fetch_api_panels(token, doc_ids):
 
     for i in range(0, len(doc_ids), batch_size):
         batch = doc_ids[i : i + batch_size]
-        payload = json.dumps({
-            "filter_document_ids": batch,
-            "include_last_viewed_panel": True,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            "https://api.granola.ai/v2/get-documents",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept-Encoding": "gzip",
-            },
-            method="POST",
-        )
-
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                if resp.headers.get("Content-Encoding") == "gzip":
-                    raw = gzip.decompress(raw)
-                body = json.loads(raw)
-
-            # API returns {"docs": [...]} or a flat list
-            docs = body.get("docs", body) if isinstance(body, dict) else body
-
+            docs = _api_get_documents(token, doc_ids=batch)
             for doc in docs:
                 panel = doc.get("last_viewed_panel")
                 if panel and panel.get("content"):
@@ -432,17 +467,31 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
     panels = state.get("documentPanels", {})
     transcripts = state.get("transcripts", {})
 
-    # Fetch panels from API if cache has none
+    # Fetch documents and panels from API to supplement the cache
     api_panels = {}
-    if not panels and not no_api:
+    if not no_api:
         token = load_api_token()
         if token:
-            log("Cache has no documentPanels, fetching from API...")
-            doc_ids = [d for d in documents if not documents[d].get("deleted_at")]
-            api_panels = fetch_api_panels(token, doc_ids)
+            log("Fetching documents from API...")
+            api_documents, api_panels = fetch_api_documents(token)
+            # Merge API documents into cache (API wins for existing, adds missing)
+            new_from_api = 0
+            for doc_id, doc in api_documents.items():
+                if doc_id not in documents:
+                    new_from_api += 1
+                documents[doc_id] = doc
+            log(f"  API returned {len(api_documents)} documents ({new_from_api} new beyond cache)")
             log(f"  Fetched {len(api_panels)} panels from API")
+
+            # Also fetch panels for any cache-only docs missing panels
+            if not panels:
+                cache_only = [d for d in documents if d not in api_panels and not documents[d].get("deleted_at")]
+                if cache_only:
+                    extra = fetch_api_panels(token, cache_only)
+                    api_panels.update(extra)
+                    log(f"  Fetched {len(extra)} additional panels for cache-only docs")
         else:
-            log("No API token found, skipping summary fetch")
+            log("No API token found, skipping API fetch")
 
     # Build reverse lookup: document_id -> [folder_name, ...]
     doc_lists_meta = state.get("documentListsMetadata", {})
