@@ -12,13 +12,32 @@ import gzip
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 from datetime import datetime
 
-DEFAULT_CACHE_PATH = os.path.expanduser(
-    "~/Library/Application Support/Granola/cache-v4.json"
+GRANOLA_CACHE_DIR = os.path.expanduser(
+    "~/Library/Application Support/Granola"
 )
+
+
+def _find_latest_cache():
+    """Find the highest-versioned cache-vN.json in Granola's data dir."""
+    if not os.path.isdir(GRANOLA_CACHE_DIR):
+        return os.path.join(GRANOLA_CACHE_DIR, "cache-v6.json")  # fallback
+    candidates = []
+    for f in os.listdir(GRANOLA_CACHE_DIR):
+        m = re.match(r"^cache-v(\d+)\.json$", f)
+        if m:
+            candidates.append((int(m.group(1)), f))
+    if not candidates:
+        return os.path.join(GRANOLA_CACHE_DIR, "cache-v6.json")  # fallback
+    candidates.sort(reverse=True)
+    return os.path.join(GRANOLA_CACHE_DIR, candidates[0][1])
+
+
+DEFAULT_CACHE_PATH = _find_latest_cache()
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
 
@@ -706,16 +725,37 @@ def main():
 
     if not os.path.exists(args.cache_path):
         print(f"Error: Cache file not found: {args.cache_path}", file=sys.stderr)
+        _notify_error(f"Cache file not found: {args.cache_path}")
         sys.exit(1)
 
-    sync(
-        cache_path=args.cache_path,
-        output_dir=args.output_dir,
-        force=args.force,
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-        no_api=args.no_api,
-    )
+    try:
+        sync(
+            cache_path=args.cache_path,
+            output_dir=args.output_dir,
+            force=args.force,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            no_api=args.no_api,
+        )
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        _notify_error(str(e))
+        sys.exit(1)
+
+
+def _notify_error(message):
+    """Send a macOS notification when the sync fails."""
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'display notification "{message}" with title "Granola Sync Failed"',
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass  # notification is best-effort
 
 
 if __name__ == "__main__":
