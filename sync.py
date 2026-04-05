@@ -175,7 +175,7 @@ def get_attendee_name(attendee):
 def extract_meeting_data(doc, panels, folders=None, api_panel=None):
     """Extract structured meeting data from a Granola document."""
     doc_id = doc["id"]
-    title = doc.get("title", "Untitled Meeting")
+    title = doc.get("title") or "Untitled Meeting"
 
     # Date and time from calendar event or created_at
     cal_event = doc.get("google_calendar_event")
