@@ -659,14 +659,16 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
     removed = 0
     for doc_id, prev in sync_state.items():
         if doc_id not in all_data:
-            old_path = os.path.join(output_dir, prev.get("filename", ""))
-            if os.path.exists(old_path):
-                if dry_run:
-                    log(f"  Would remove orphan: {prev['filename']}")
-                else:
-                    os.remove(old_path)
-                    log(f"  Removed orphan: {prev['filename']}")
-                removed += 1
+            prev_filename = prev.get("filename", "")
+            if prev_filename:
+                old_path = os.path.join(output_dir, prev_filename)
+                if os.path.exists(old_path):
+                    if dry_run:
+                        log(f"  Would remove orphan: {prev_filename}")
+                    else:
+                        os.remove(old_path)
+                        log(f"  Removed orphan: {prev_filename}")
+                    removed += 1
             # Preserve transcript state so the file isn't orphaned
             if prev.get("transcript_saved"):
                 new_sync_state[doc_id] = {
