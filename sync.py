@@ -14,10 +14,30 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime
+
+
+class TransientNetworkError(RuntimeError):
+    """Raised when the API is unreachable due to a transient network condition.
+
+    Treated as a non-failure by main(): logs and exits 0 without a desktop
+    notification. Distinct from auth/format errors, which still notify.
+    """
+
+
+def _is_transient_network_error(exc):
+    if isinstance(exc, (socket.timeout, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", exc)
+        return isinstance(reason, (OSError, socket.timeout, socket.gaierror))
+    return False
 
 GRANOLA_CACHE_DIR = os.path.expanduser(
     "~/Library/Application Support/Granola"
@@ -513,11 +533,24 @@ def _api_get_documents(token, doc_ids=None):
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read()
-        if resp.headers.get("Content-Encoding") == "gzip":
-            raw = gzip.decompress(raw)
-        body = json.loads(raw)
+    # Retry transient network errors — Mac may have just woken from sleep or
+    # Wi-Fi may be reconnecting. Backoff: 2s, 8s, 20s.
+    last_exc = None
+    for attempt, delay in enumerate((2, 8, 20, None)):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                body = json.loads(raw)
+            break
+        except Exception as e:
+            last_exc = e
+            if not _is_transient_network_error(e) or delay is None:
+                raise
+            time.sleep(delay)
+    else:
+        raise last_exc
 
     # Handle API-level errors (e.g. {"message": "Unsupported client"})
     if isinstance(body, dict) and "message" in body and "docs" not in body:
@@ -529,12 +562,14 @@ def _api_get_documents(token, doc_ids=None):
 def fetch_api_documents(token):
     """Fetch all documents from the Granola API.
 
-    Returns a tuple (documents_dict, api_panels_dict) where:
+    Returns a tuple (documents_dict, api_panels_dict, transient_failure) where:
     - documents_dict maps doc_id -> document dict (matching cache format)
     - api_panels_dict maps doc_id -> Tiptap content dict
+    - transient_failure is True iff the fetch failed for a transient network reason
     """
     documents = {}
     api_panels = {}
+    transient_failure = False
 
     try:
         docs = _api_get_documents(token)
@@ -548,8 +583,10 @@ def fetch_api_documents(token):
                 api_panels[doc_id] = panel["content"]
     except Exception as e:
         print(f"  Warning: API fetch failed: {e}", file=sys.stderr)
+        if _is_transient_network_error(e):
+            transient_failure = True
 
-    return documents, api_panels
+    return documents, api_panels, transient_failure
 
 
 def fetch_api_panels(token, doc_ids):
@@ -607,11 +644,12 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
 
     # Fetch documents and panels from API to supplement the cache
     api_panels = {}
+    api_transient_failure = False
     if not no_api:
         token = load_api_token()
         if token:
             log("Fetching documents from API...")
-            api_documents, api_panels = fetch_api_documents(token)
+            api_documents, api_panels, api_transient_failure = fetch_api_documents(token)
             # Merge API documents into cache (API wins for existing, adds missing)
             new_from_api = 0
             for doc_id, doc in api_documents.items():
@@ -662,6 +700,11 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
         except OSError:
             pass
     if len(documents) == 0 and _prior_doc_count > 5:
+        if api_transient_failure:
+            raise TransientNetworkError(
+                f"API unreachable; cache produced 0 docs ({_prior_doc_count} on disk). "
+                "Skipping this run."
+            )
         raise RuntimeError(
             f"Loaded 0 documents but sync state tracks {_prior_doc_count} files. "
             "Cache may be stale or API auth expired. Run with --no-api to use cache "
@@ -878,6 +921,9 @@ def main():
             verbose=args.verbose,
             no_api=args.no_api,
         )
+    except TransientNetworkError as e:
+        print(f"Skipped: {e}", file=sys.stderr)
+        sys.exit(0)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         _notify_error(str(e))
