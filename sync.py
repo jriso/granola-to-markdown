@@ -152,6 +152,9 @@ def _decrypt_granola_file(path):
 DEFAULT_CACHE_PATH = _find_latest_cache()
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
+NOTIFY_STATE_FILE = ".notify-state.json"
+NOTIFY_THROTTLE_SECONDS = 4 * 60 * 60  # don't repeat the same notification within 4h
+ORPHAN_REMOVAL_MAX_FRACTION = 0.30  # refuse to delete > this fraction of tracked files in one run
 
 
 # ---------------------------------------------------------------------------
@@ -838,25 +841,45 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
 
     # Clean up files for documents no longer in cache
     # Note: transcript files are preserved even if the document leaves the cache
-    removed = 0
+    orphans = []
     for doc_id, prev in sync_state.items():
         if doc_id not in all_data:
             prev_filename = prev.get("filename", "")
             if prev_filename:
                 old_path = os.path.join(output_dir, prev_filename)
                 if os.path.exists(old_path):
-                    if dry_run:
-                        log(f"  Would remove orphan: {prev_filename}")
-                    else:
-                        os.remove(old_path)
-                        log(f"  Removed orphan: {prev_filename}")
-                    removed += 1
+                    orphans.append((doc_id, prev_filename, old_path))
             # Preserve transcript state so the file isn't orphaned
             if prev.get("transcript_saved"):
                 new_sync_state[doc_id] = {
                     "transcript_saved": True,
                     "transcript_filename": prev["transcript_filename"],
                 }
+
+    # Safety bound: a sudden mass-orphan is almost always a bug (schema change,
+    # partial API response, auth scope shrink). Refuse rather than delete in bulk.
+    prior_tracked = sum(1 for v in sync_state.values() if v.get("filename"))
+    if (
+        not dry_run
+        and prior_tracked > 10
+        and len(orphans) / prior_tracked > ORPHAN_REMOVAL_MAX_FRACTION
+    ):
+        raise RuntimeError(
+            f"Refusing to remove {len(orphans)} of {prior_tracked} tracked files "
+            f"(> {ORPHAN_REMOVAL_MAX_FRACTION:.0%}). This usually indicates a "
+            "schema or API change. Inspect the orphan list above, then either "
+            "remove the obsolete files manually or delete the corresponding "
+            "entries from .sync-state.json before re-running."
+        )
+
+    removed = 0
+    for _doc_id, prev_filename, old_path in orphans:
+        if dry_run:
+            log(f"  Would remove orphan: {prev_filename}")
+        else:
+            os.remove(old_path)
+            log(f"  Removed orphan: {prev_filename}")
+        removed += 1
 
     if not dry_run:
         save_sync_state(output_dir, new_sync_state)
@@ -909,7 +932,9 @@ def main():
 
     if not os.path.exists(args.cache_path):
         print(f"Error: Cache file not found: {args.cache_path}", file=sys.stderr)
-        _notify_error(f"Cache file not found: {args.cache_path}")
+        _notify_error(
+            f"Cache file not found: {args.cache_path}", args.output_dir
+        )
         sys.exit(1)
 
     try:
@@ -926,23 +951,56 @@ def main():
         sys.exit(0)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-        _notify_error(str(e))
+        _notify_error(str(e), args.output_dir)
         sys.exit(1)
 
 
-def _notify_error(message):
-    """Send a macOS notification when the sync fails."""
+def _notify_error(message, output_dir=None):
+    """Send a macOS notification when the sync fails.
+
+    Throttles per-message: the same message within NOTIFY_THROTTLE_SECONDS is
+    suppressed. State is `{message: last_notified_at}` keyed by message text;
+    entries older than 24h are pruned so the file can't grow without bound.
+    """
+    state_path = (
+        os.path.join(output_dir, NOTIFY_STATE_FILE) if output_dir else None
+    )
+    now = time.time()
+    history = {}
+    if state_path and os.path.exists(state_path):
+        try:
+            with open(state_path) as f:
+                history = json.load(f)
+            if not isinstance(history, dict):
+                history = {}
+        except (OSError, json.JSONDecodeError):
+            history = {}
+
+    if now - history.get(message, 0) < NOTIFY_THROTTLE_SECONDS:
+        return
+
+    # AppleScript double-quotes need escaping
+    safe = message.replace("\\", "\\\\").replace('"', '\\"')
     try:
         subprocess.run(
             [
                 "osascript", "-e",
-                f'display notification "{message}" with title "Granola Sync Failed"',
+                f'display notification "{safe}" with title "Granola Sync Failed"',
             ],
             capture_output=True,
             timeout=5,
         )
     except Exception:
-        pass  # notification is best-effort
+        return  # notification is best-effort
+
+    history[message] = now
+    history = {m: t for m, t in history.items() if now - t < 24 * 60 * 60}
+    if state_path:
+        try:
+            with open(state_path, "w") as f:
+                json.dump(history, f)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
