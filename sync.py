@@ -31,6 +31,16 @@ class TransientNetworkError(RuntimeError):
     """
 
 
+class AuthExpiredError(RuntimeError):
+    """Raised when the Granola API token has expired (HTTP 401).
+
+    This is a self-healing condition: the Granola desktop app refreshes the
+    token whenever it's open. main() treats it as a non-failure (exit 0) but
+    sends a single throttled notification so the user knows to open the app,
+    rather than emitting a hard error every run.
+    """
+
+
 def _is_transient_network_error(exc):
     if isinstance(exc, (socket.timeout, ConnectionError, TimeoutError)):
         return True
@@ -565,14 +575,17 @@ def _api_get_documents(token, doc_ids=None):
 def fetch_api_documents(token):
     """Fetch all documents from the Granola API.
 
-    Returns a tuple (documents_dict, api_panels_dict, transient_failure) where:
+    Returns a tuple (documents_dict, api_panels_dict, transient_failure,
+    auth_expired) where:
     - documents_dict maps doc_id -> document dict (matching cache format)
     - api_panels_dict maps doc_id -> Tiptap content dict
     - transient_failure is True iff the fetch failed for a transient network reason
+    - auth_expired is True iff the API rejected the token with HTTP 401
     """
     documents = {}
     api_panels = {}
     transient_failure = False
+    auth_expired = False
 
     try:
         docs = _api_get_documents(token)
@@ -586,10 +599,12 @@ def fetch_api_documents(token):
                 api_panels[doc_id] = panel["content"]
     except Exception as e:
         print(f"  Warning: API fetch failed: {e}", file=sys.stderr)
-        if _is_transient_network_error(e):
+        if isinstance(e, urllib.error.HTTPError) and e.code == 401:
+            auth_expired = True
+        elif _is_transient_network_error(e):
             transient_failure = True
 
-    return documents, api_panels, transient_failure
+    return documents, api_panels, transient_failure, auth_expired
 
 
 def fetch_api_panels(token, doc_ids):
@@ -648,11 +663,14 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
     # Fetch documents and panels from API to supplement the cache
     api_panels = {}
     api_transient_failure = False
+    api_auth_expired = False
     if not no_api:
         token = load_api_token()
         if token:
             log("Fetching documents from API...")
-            api_documents, api_panels, api_transient_failure = fetch_api_documents(token)
+            api_documents, api_panels, api_transient_failure, api_auth_expired = (
+                fetch_api_documents(token)
+            )
             # Merge API documents into cache (API wins for existing, adds missing)
             new_from_api = 0
             for doc_id, doc in api_documents.items():
@@ -703,6 +721,11 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
         except OSError:
             pass
     if len(documents) == 0 and _prior_doc_count > 5:
+        if api_auth_expired:
+            raise AuthExpiredError(
+                "Granola API token expired — open the Granola app to refresh it. "
+                f"Skipping this run ({_prior_doc_count} notes preserved on disk)."
+            )
         if api_transient_failure:
             raise TransientNetworkError(
                 f"API unreachable; cache produced 0 docs ({_prior_doc_count} on disk). "
@@ -948,6 +971,13 @@ def main():
         )
     except TransientNetworkError as e:
         print(f"Skipped: {e}", file=sys.stderr)
+        sys.exit(0)
+    except AuthExpiredError as e:
+        # Self-healing once the Granola app refreshes the token. Send one
+        # throttled notification so the user knows to open the app, but exit 0
+        # so this expected condition isn't treated as a hard failure.
+        print(f"Skipped: {e}", file=sys.stderr)
+        _notify_error(str(e), args.output_dir)
         sys.exit(0)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
