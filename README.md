@@ -163,6 +163,8 @@ This removes the MCP server config (if installed), GranolaMCP, and launchd agent
 
 **Missing meetings** — Granola's local cache has a limited retention window. Export regularly (or use `--with-launchd`) to capture meetings before they age out.
 
+**Sync skipped: "Granola API token expired"** — The API access token has a ~6-hour TTL and is only refreshed while the Granola desktop app is running. If the app stays closed longer than that, the token expires and the sync skips that run (exiting cleanly, with existing notes preserved) and sends a single notification. Fix: open the Granola app — it refreshes the token, and the next scheduled run picks up automatically. Keeping Granola set to launch at login avoids this.
+
 ## License
 
 MIT
