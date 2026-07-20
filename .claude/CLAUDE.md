@@ -2,9 +2,17 @@
 
 Export Granola meeting notes as markdown and access them via Claude Code.
 
-## MCP Server (`granola-mcp`)
+## Data source
 
-After running `install.sh`, Claude Code has access to Granola meetings via MCP tools:
+The `sync.py` script pulls from Granola's **official public API** (`https://public-api.granola.ai`)
+using a personal API key (`grn_…`), read from the `GRANOLA_API_KEY` env var or a `.granola_api_key`
+file next to the script. It no longer reads Granola's local cache — recent Granola versions (7.42x+)
+encrypt every local artifact behind a macOS Keychain key only the app can read, which killed the old
+cache-decryption path (legacy `load_cache`/`_decrypt_granola_file` remain in the file but are dead).
+
+## MCP Server (`granola-mcp`)  — optional, may be broken
+
+After running `install.sh --with-mcp`, Claude Code has access to Granola meetings via MCP tools:
 
 | Tool | What it does |
 |------|-------------|
@@ -18,7 +26,9 @@ After running `install.sh`, Claude Code has access to Granola meetings via MCP t
 | `export_meeting` | Export a meeting as markdown |
 | `analyze_patterns` | Analyze meeting patterns over time |
 
-Data source: Local Granola cache at `~/Library/Application Support/Granola/cache-v4.json`. No API key needed.
+> ⚠️ GranolaMCP reads Granola's **local cache**, which Granola 7.42x+ encrypts — so these tools may
+> return nothing on recent versions. This is independent of the markdown sync, which uses the API.
+> For interactive search, prefer Granola's official MCP server at `https://mcp.granola.ai/mcp`.
 
 ## Sync Script
 
@@ -27,7 +37,7 @@ Run manually:
 python3 sync.py --verbose
 ```
 
-Flags: `--cache-path`, `--output-dir`, `--force`, `--dry-run`, `--verbose`
+Flags: `--output-dir`, `--force`, `--dry-run`, `--verbose` (`--cache-path` is deprecated/ignored)
 
 Default output: `~/granola-notes`
 
@@ -39,11 +49,16 @@ Each meeting becomes `YYYY-MM-DD_slugified-title.md` with:
 - **## Notes**: Your notes from the meeting
 - **## Summary**: AI-generated summary
 
-Transcripts (when available) are saved as `YYYY-MM-DD_title_transcript.md`.
+Transcripts (when the meeting has one) are saved as `YYYY-MM-DD_title_transcript.md`.
+
+Note: the public API does not expose the user's hand-typed notes, only the AI summary. On refresh,
+`read_existing_user_notes()` recovers any existing `## Notes` section from disk so it isn't lost.
 
 ## Troubleshooting
 
-- **MCP tools not working**: Check `~/.mcp.json` has a `granola-mcp` entry. Re-run `./install.sh`.
-- **No meetings found**: Open Granola and attend/record a meeting first. The cache file must exist.
+- **No API key found**: Set `GRANOLA_API_KEY` or create `.granola_api_key` (a `grn_…` key from
+  Granola → Settings → Connectors → API keys; requires a Business/Enterprise plan).
+- **API key rejected (401)**: Key invalid or revoked. Regenerate it and update `.granola_api_key`.
 - **Sync shows 0 created**: Meetings are already synced. Use `--force` to re-export all.
-- **Stale data**: Granola updates its cache after meetings end. Wait a moment and retry.
+- **Missing meetings**: The API only returns notes that have a generated AI summary + transcript.
+- **MCP tools not working**: See the GranolaMCP caveat above — likely broken on Granola 7.42x+.
