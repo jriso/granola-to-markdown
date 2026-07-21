@@ -168,7 +168,10 @@ def _decrypt_granola_file(path):
         return None
 
 
-DEFAULT_CACHE_PATH = _find_latest_cache()
+# The local cache is no longer used (see module docstring); the legacy
+# _find_latest_cache()/load_cache() helpers are retained but dead. Not computed
+# at import so `--help` works cleanly and cross-platform.
+DEFAULT_CACHE_PATH = None
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
 NOTIFY_STATE_FILE = ".notify-state.json"
@@ -1019,14 +1022,20 @@ def fetch_note_list(key, log, page_limit=100):
     """Page through GET /notes, returning every note summary."""
     notes = []
     cursor = None
+    seen_cursors = set()
     while True:
         params = {"limit": page_limit}
         if cursor:
             params["cursor"] = cursor
         data = _api_request("/notes", key, params)
         notes.extend(data.get("notes", []))
-        if data.get("hasMore") and data.get("cursor"):
-            cursor = data["cursor"]
+        next_cursor = data.get("cursor")
+        # Stop unless the API reports more pages AND hands us a new cursor.
+        # Guarding against a repeated cursor avoids an infinite loop (and
+        # duplicate notes) if the API ever returns hasMore with a stuck cursor.
+        if data.get("hasMore") and next_cursor and next_cursor not in seen_cursors:
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
             log(f"  fetched {len(notes)} note summaries so far...")
         else:
             break
@@ -1288,8 +1297,8 @@ def main():
     )
     parser.add_argument(
         "--cache-path",
-        default=DEFAULT_CACHE_PATH,
-        help=f"Path to Granola cache file (default: {DEFAULT_CACHE_PATH})",
+        default=None,
+        help="(Deprecated, ignored) the local cache is no longer used.",
     )
     parser.add_argument(
         "--output-dir",
