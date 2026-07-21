@@ -3,30 +3,50 @@
 Sync your [Granola](https://granola.ai) meeting notes to clean, permanent markdown — accessible by [Claude](https://claude.ai), [OpenClaw](https://github.com/openclaw/openclaw), or any AI agent.
 
 - Exports every meeting as a markdown file with YAML frontmatter (attendees, date, duration, notes, AI summary)
-- Captures transcripts before Granola's cache evicts them
+- Captures the full transcript alongside each meeting
+- Pulls from Granola's official public API — full history, no reliance on the local cache
 - Optionally syncs automatically every 30 minutes
 - Optionally installs the [GranolaMCP](https://github.com/pedramamini/GranolaMCP) server for live meeting search in Claude Code
 
 ## Prerequisites
 
-- **macOS** (Granola is a Mac app)
-- **Granola** desktop app installed with at least one meeting recorded
+- **macOS** (for the optional launchd auto-sync; the sync script itself is cross-platform)
+- A **Granola account on a Business or Enterprise plan** — required to create an API key
+- A **Granola Personal API key** (`grn_…`) — see [Get an API key](#get-an-api-key) below
 - **Python 3.12+**
 - **git**
+
+## Get an API key
+
+The sync pulls from Granola's [public API](https://docs.granola.ai), so it needs a personal API key:
+
+1. In the Granola desktop app, go to **Settings → Connectors → API keys → Create new key**.
+2. Copy the generated key (it starts with `grn_`).
+3. Make it available to the sync in either way:
+   - **Env var:** `export GRANOLA_API_KEY=grn_your_key_here`, or
+   - **Key file:** save it to `granola-to-markdown/.granola_api_key` (one line, just the key).
+     This file is gitignored so it won't be committed.
+
+> Creating a key requires a Business/Enterprise plan. The older versions of this tool read
+> Granola's local cache and needed no key — that path no longer works (see [below](#a-note-on---with-mcp)).
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/jriso/granola-to-markdown.git
 cd granola-to-markdown
+
+# Provide your Granola API key (see "Get an API key" above)
+echo 'grn_your_key_here' > .granola_api_key   # or: export GRANOLA_API_KEY=grn_...
+
 ./install.sh
 ```
 
-That's it. Your meetings are now in `~/granola-notes/` as permanent markdown files.
+Your meetings are now in `~/granola-notes/` as permanent markdown files.
 
 ## What the Installer Does
 
-1. Verifies macOS, Python 3.12+, git, and Granola are present
+1. Verifies Python 3.12+, git, and a Granola API key are present
 2. Creates `~/granola-notes/` and runs the initial export
 
 With `--with-mcp`, it also:
@@ -49,7 +69,16 @@ If you want Claude to interactively search and query your meetings (by participa
 ./install.sh --with-mcp
 ```
 
-This gives Claude tools like `search_meetings`, `get_transcript`, and `get_meeting_notes` — useful if you have hundreds of meetings and want fast, targeted lookups. The markdown export and MCP server read from the same source (Granola's local cache), so the data is identical. The difference is access pattern: bulk files vs. interactive queries.
+This gives Claude tools like `search_meetings`, `get_transcript`, and `get_meeting_notes` — useful if you have hundreds of meetings and want fast, targeted lookups.
+
+### A note on `--with-mcp`
+
+> ⚠️ **This feature may no longer work.** [GranolaMCP](https://github.com/pedramamini/GranolaMCP)
+> reads Granola's **local cache**, which recent Granola versions (7.42x+) encrypt behind a macOS
+> Keychain key only the Granola app can read. On affected versions the cache is unreadable by
+> third-party tools, so GranolaMCP returns nothing. The markdown export in this repo is unaffected —
+> it uses the public API. For interactive search, prefer Granola's **official** MCP server at
+> `https://mcp.granola.ai/mcp` (browser OAuth), which you can add to Claude Code directly.
 
 ## Running Sync Manually
 
@@ -60,7 +89,7 @@ python3 sync.py --verbose
 | Flag | Description |
 |------|-------------|
 | `--output-dir <path>` | Output directory (default: `~/granola-notes`) |
-| `--cache-path <path>` | Granola cache path (default: auto-detected) |
+| `--cache-path <path>` | *(Deprecated — ignored. The local cache is no longer used.)* |
 | `--force` | Re-export all meetings, not just changed ones |
 | `--dry-run` | Preview what would change without writing |
 | `--verbose` | Print detailed progress |
@@ -74,6 +103,8 @@ To sync every 30 minutes in the background:
 ```
 
 This installs a macOS launchd agent that runs the sync script automatically. Logs go to `~/granola-notes/.sync.log`.
+
+The launchd agent reads your API key from the `.granola_api_key` **file** (it doesn't inherit your shell's `GRANOLA_API_KEY` env var), so make sure that file exists for background sync to work.
 
 To stop automatic sync:
 
@@ -112,7 +143,7 @@ Your notes from the meeting...
 AI-generated summary of the discussion...
 ```
 
-Transcripts (when available in the cache) are saved as separate `*_transcript.md` files.
+Transcripts (when the meeting has one) are saved as separate `*_transcript.md` files.
 
 ## Remote AI Access
 
@@ -155,15 +186,17 @@ This removes the MCP server config (if installed), GranolaMCP, and launchd agent
 
 ## Troubleshooting
 
-**"Cache file not found"** — Open the Granola app and make sure you've attended at least one meeting. The cache is created after your first meeting.
+**"No Granola API key found"** — The sync needs your `grn_` key. Set `GRANOLA_API_KEY` or create a `.granola_api_key` file in the repo. See [Get an API key](#get-an-api-key).
 
-**MCP tools not working in Claude Code** — Make sure you installed with `--with-mcp`. Check that `~/.mcp.json` contains a `granola-mcp` entry. Re-run `./install.sh --with-mcp` to fix.
+**Sync skipped: "Granola API key rejected (401)"** — Your key is invalid or was revoked. Regenerate it in **Granola → Settings → Connectors → API keys** and update your `.granola_api_key` file (or `GRANOLA_API_KEY`).
+
+**MCP tools not working in Claude Code** — Note that `--with-mcp` may be broken on recent Granola versions (see [A note on `--with-mcp`](#a-note-on---with-mcp)). If you still want to try it: check that `~/.mcp.json` contains a `granola-mcp` entry and re-run `./install.sh --with-mcp`.
 
 **Sync shows "0 created, 0 updated"** — Your meetings are already exported. Use `--force` to re-export everything.
 
-**Missing meetings** — Granola's local cache has a limited retention window. Export regularly (or use `--with-launchd`) to capture meetings before they age out.
+**Missing meetings** — The API only returns notes that have a generated AI summary and transcript, so a meeting that was never processed by Granola won't appear. Otherwise the API serves your full history, regardless of age.
 
-**Sync skipped: "Granola API token expired"** — The API access token has a ~6-hour TTL and is only refreshed while the Granola desktop app is running. If the app stays closed longer than that, the token expires and the sync skips that run (exiting cleanly, with existing notes preserved) and sends a single notification. Fix: open the Granola app — it refreshes the token, and the next scheduled run picks up automatically. Keeping Granola set to launch at login avoids this.
+**Sync skipped: network error** — The API was temporarily unreachable (or rate-limited). The run exits cleanly with existing notes preserved; the next scheduled run retries automatically.
 
 ## License
 

@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Sync Granola meeting notes to markdown files.
 
-Reads Granola's local cache and exports each meeting as a clean markdown
-file with YAML frontmatter. Supports incremental updates via .sync-state.json.
+Pulls meetings from the official Granola public API (https://public-api.granola.ai)
+and exports each as a clean markdown file with YAML frontmatter. Supports
+incremental updates via .sync-state.json.
 
-Requires the `cryptography` package.
+Auth: a `grn_` API key (Granola → Settings → Connectors → API keys; requires a
+Business/Enterprise plan), read from the GRANOLA_API_KEY env var or the
+`.granola_api_key` file next to this script.
+
+The legacy local-cache decryption path (see load_cache / _decrypt_granola_file)
+is retained but dead: Granola 7.42x moved its data-encryption key into an
+app-entitlement-gated macOS Keychain item, so user-space scripts can no longer
+read the on-disk cache/token/db. See main() → sync_via_api().
 """
 
 import argparse
@@ -19,6 +27,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
@@ -159,7 +168,10 @@ def _decrypt_granola_file(path):
         return None
 
 
-DEFAULT_CACHE_PATH = _find_latest_cache()
+# The local cache is no longer used (see module docstring); the legacy
+# _find_latest_cache()/load_cache() helpers are retained but dead. Not computed
+# at import so `--help` works cleanly and cross-platform.
+DEFAULT_CACHE_PATH = None
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
 NOTIFY_STATE_FILE = ".notify-state.json"
@@ -423,6 +435,22 @@ def format_transcript(utterances):
         else:
             lines.append(f"{time_str}{text}")
     return "\n".join(lines).strip()
+
+
+def read_existing_user_notes(filepath):
+    """Return the text under a '## Notes' heading in an existing note file.
+
+    The public API does not return the user's hand-typed notes, so when we
+    refresh an existing file from the API we recover its ## Notes section from
+    disk and re-inject it — otherwise a summary refresh would wipe real content.
+    """
+    try:
+        with open(filepath) as f:
+            text = f.read()
+    except OSError:
+        return ""
+    m = re.search(r"^## Notes\s*\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
 def build_markdown(data):
@@ -917,14 +945,360 @@ def sync(cache_path, output_dir, force=False, dry_run=False, verbose=False, no_a
     print(f"{prefix}Sync complete: {', '.join(parts)}")
 
 
+# ---------------------------------------------------------------------------
+# Official Granola public API (https://public-api.granola.ai)
+#
+# Replaces the legacy local-cache decryption path. Granola 7.42x moved its data
+# encryption key out of the on-disk `storage.dek` file into an app-entitlement-
+# gated macOS Keychain item (service `com.granola.app.dek`), and now encrypts
+# every local artifact (cache, token, SQLite db) with it — so a user-space
+# script can no longer read them. The supported path is the public REST API,
+# authenticated with a `grn_` key (Settings → Connectors → API keys; requires a
+# Business/Enterprise plan). Notes are keyed by the UUID in `web_url`, which
+# matches the `granola_id` the old cache path wrote, so existing files and
+# `.sync-state.json` carry over seamlessly.
+# ---------------------------------------------------------------------------
+
+API_BASE = "https://public-api.granola.ai/v1"
+API_KEY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".granola_api_key"
+)
+
+
+def load_api_key():
+    """Load the Granola public-API key (grn_...) from env or the key file."""
+    key = os.environ.get("GRANOLA_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        with open(API_KEY_FILE) as f:
+            key = f.read().strip()
+    except OSError:
+        return None
+    if not key or key.startswith("grn_PASTE"):
+        return None
+    return key
+
+
+def _api_request(path, key, params=None):
+    """GET a public-API endpoint and return parsed JSON.
+
+    Raises AuthExpiredError on 401 (bad/expired key), TransientNetworkError on
+    429/network failures, RuntimeError on other HTTP errors.
+    """
+    url = API_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise AuthExpiredError(
+                "Granola API key rejected (401). Regenerate it in Granola → "
+                f"Settings → Connectors → API keys and update {API_KEY_FILE}."
+            )
+        if e.code == 429:
+            raise TransientNetworkError(
+                "Granola API rate limit (429); will retry next run."
+            )
+        body = b""
+        try:
+            body = e.read()[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"Granola API HTTP {e.code} for {path}: {body!r}")
+    except urllib.error.URLError as e:
+        if _is_transient_network_error(e):
+            raise TransientNetworkError(f"Granola API unreachable: {e.reason}")
+        raise
+
+
+def fetch_note_list(key, log, page_limit=100):
+    """Page through GET /notes, returning every note summary."""
+    notes = []
+    cursor = None
+    seen_cursors = set()
+    while True:
+        params = {"limit": page_limit}
+        if cursor:
+            params["cursor"] = cursor
+        data = _api_request("/notes", key, params)
+        notes.extend(data.get("notes", []))
+        next_cursor = data.get("cursor")
+        # Stop unless the API reports more pages AND hands us a new cursor.
+        # Guarding against a repeated cursor avoids an infinite loop (and
+        # duplicate notes) if the API ever returns hasMore with a stuck cursor.
+        if data.get("hasMore") and next_cursor and next_cursor not in seen_cursors:
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+            log(f"  fetched {len(notes)} note summaries so far...")
+        else:
+            break
+    return notes
+
+
+def fetch_note_detail(key, note_id):
+    """GET a single note with its transcript included."""
+    return _api_request(f"/notes/{note_id}", key, {"include": "transcript"})
+
+
+def _parse_api_dt(s):
+    """parse_datetime, tolerant of a trailing 'Z' on older Pythons."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return parse_datetime(s)
+
+
+def _api_note_uuid(note):
+    web = note.get("web_url") or ""
+    if "/" in web:
+        return web.rsplit("/", 1)[-1]
+    return note.get("id")
+
+
+def api_note_to_data(note):
+    """Map a public-API note detail into the build_markdown() data contract."""
+    uuid = _api_note_uuid(note)
+    title = note.get("title") or "Untitled Meeting"
+
+    cal = note.get("calendar_event") or {}
+    start_dt = _parse_api_dt(cal.get("scheduled_start_time")) or _parse_api_dt(
+        note.get("created_at")
+    ) or datetime.now()
+
+    duration_minutes = None
+    s = _parse_api_dt(cal.get("scheduled_start_time"))
+    e = _parse_api_dt(cal.get("scheduled_end_time"))
+    if s and e:
+        duration_minutes = int((e - s).total_seconds() / 60)
+
+    attendees = []
+    for att in note.get("attendees") or []:
+        attendees.append({
+            "name": att.get("name") or att.get("email", "Unknown"),
+            "email": att.get("email", ""),
+        })
+
+    folders = []
+    for fm in note.get("folder_membership") or []:
+        name = fm.get("name") or fm.get("title") or fm.get("folder_name")
+        if name:
+            folders.append(name)
+
+    summary_md = (
+        note.get("summary_markdown") or note.get("summary_text") or ""
+    ).strip()
+
+    return {
+        "id": uuid,
+        "title": title,
+        "date": start_dt.strftime("%Y-%m-%d"),
+        "time": start_dt.strftime("%H:%M"),
+        "duration_minutes": duration_minutes,
+        "attendees": attendees,
+        "folders": folders,
+        # The public API does not expose the user's hand-typed notes, only the
+        # AI summary. Left blank; unchanged existing files keep their ## Notes.
+        "notes": "",
+        "summary": summary_md,
+        "updated_at": note.get("updated_at", ""),
+    }
+
+
+def api_transcript_utterances(note):
+    """Map public-API transcript entries into format_transcript()'s contract."""
+    out = []
+    for e in note.get("transcript") or []:
+        out.append({
+            "source": (e.get("speaker") or {}).get("source", ""),
+            "text": e.get("text", ""),
+            "start_timestamp": e.get("start_time", ""),
+        })
+    return out
+
+
+def sync_via_api(output_dir, force=False, dry_run=False, verbose=False):
+    """Sync notes from the official Granola public API into markdown files."""
+    log = lambda msg: print(msg) if verbose else None
+
+    key = load_api_key()
+    if not key:
+        raise RuntimeError(
+            "No Granola API key found. Put your grn_ key in "
+            f"{API_KEY_FILE} or set the GRANOLA_API_KEY env var."
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    sync_state = load_sync_state(output_dir) if not force else {}
+
+    log("Fetching note list from Granola API...")
+    summaries = fetch_note_list(key, log)
+    log(f"API returned {len(summaries)} notes")
+
+    prior_on_disk = 0
+    if os.path.isdir(output_dir):
+        prior_on_disk = sum(
+            1 for f in os.listdir(output_dir)
+            if f.endswith(".md") and not f.endswith("_transcript.md")
+        )
+    # API returned nothing but files exist -> transient/auth issue, not a mass
+    # deletion. Skip and preserve everything on disk.
+    if len(summaries) == 0 and prior_on_disk > 5:
+        raise TransientNetworkError(
+            f"API returned 0 notes but {prior_on_disk} exist on disk; skipping run."
+        )
+
+    # Reverse index: note_id -> (uuid, updated_at) for incremental skips.
+    note_index = {}
+    for uuid, prev in sync_state.items():
+        nid = prev.get("note_id")
+        if nid:
+            note_index[nid] = (uuid, prev.get("updated_at"))
+
+    created = updated = skipped = transcripts_saved = 0
+    # Start from existing state so notes the API doesn't return (e.g. those
+    # without an AI summary) are preserved rather than orphaned/deleted.
+    new_sync_state = dict(sync_state)
+    used_filenames = {
+        v.get("filename") for v in sync_state.values() if v.get("filename")
+    }
+
+    for summ in summaries:
+        note_id = summ.get("id")
+        summ_updated = summ.get("updated_at")
+
+        # Fast incremental skip: unchanged since last sync (by note_id).
+        if not force and note_id in note_index:
+            _uuid, prev_updated = note_index[note_id]
+            if prev_updated == summ_updated:
+                skipped += 1
+                continue
+
+        try:
+            note = fetch_note_detail(key, note_id)
+        except (TransientNetworkError, AuthExpiredError):
+            raise
+        except Exception as ex:
+            log(f"  skip {note_id}: detail fetch failed: {ex}")
+            continue
+
+        data = api_note_to_data(note)
+        uuid = data["id"]
+        prev = sync_state.get(uuid, {})
+        slug = slugify(data["title"]) or "untitled"
+
+        # Preserve an existing .md when content is unchanged. This is the
+        # first-run migration case (prior state has no note_id, so the fast
+        # skip above misses): don't rewrite the file — it may contain the
+        # user's hand-typed ## Notes the API can't return — just backfill
+        # note_id and any missing transcript.
+        content_unchanged = (
+            not force
+            and prev.get("filename")
+            and prev.get("updated_at") == data["updated_at"]
+        )
+
+        entry = dict(prev)
+        entry["note_id"] = note_id
+        entry["updated_at"] = data["updated_at"]
+
+        if content_unchanged:
+            skipped += 1
+            filename = prev["filename"]
+        else:
+            filename = prev.get("filename")
+            if not filename:
+                filename = f"{data['date']}_{slug}.md"
+                if filename in used_filenames:
+                    filename = f"{data['date']}_{slug}_{uuid[:8]}.md"
+            # Recover the user's hand-typed ## Notes from the existing file
+            # (the API can't return them) so a summary refresh preserves them.
+            old_filename = prev.get("filename")
+            if old_filename and not data["notes"]:
+                recovered = read_existing_user_notes(
+                    os.path.join(output_dir, old_filename)
+                )
+                if recovered:
+                    data["notes"] = recovered
+            # Rename detection (title/date changed).
+            if old_filename and old_filename != filename:
+                old_path = os.path.join(output_dir, old_filename)
+                if os.path.exists(old_path) and not dry_run:
+                    os.remove(old_path)
+
+            filepath = os.path.join(output_dir, filename)
+            content = build_markdown(data)
+            if dry_run:
+                log(f"  Would {'update' if prev else 'create'}: {filename}")
+            else:
+                with open(filepath, "w") as f:
+                    f.write(content)
+            if prev:
+                updated += 1
+                log(f"  Updated: {filename}")
+            else:
+                created += 1
+                log(f"  Created: {filename}")
+            entry["filename"] = filename
+
+        used_filenames.add(filename)
+
+        # Save transcript once (backfills notes that never had one before).
+        utterances = api_transcript_utterances(note)
+        if utterances and not entry.get("transcript_saved"):
+            transcript_filename = f"{data['date']}_{slug}_transcript.md"
+            transcript_path = os.path.join(output_dir, transcript_filename)
+            transcript_md = format_transcript(utterances)
+            if dry_run:
+                log(
+                    f"  Would save transcript: {transcript_filename} "
+                    f"({len(utterances)} utterances)"
+                )
+            else:
+                with open(transcript_path, "w") as f:
+                    f.write(f'---\ntitle: "{data["title"]} — Transcript"\n')
+                    f.write(f"date: {data['date']}\n")
+                    f.write(f"granola_id: {uuid}\n")
+                    f.write("type: transcript\n---\n\n")
+                    f.write(f"# {data['title']} — Transcript\n\n")
+                    f.write(transcript_md)
+                    f.write("\n")
+                log(
+                    f"  Saved transcript: {transcript_filename} "
+                    f"({len(utterances)} utterances)"
+                )
+            entry["transcript_saved"] = True
+            entry["transcript_filename"] = transcript_filename
+            transcripts_saved += 1
+
+        new_sync_state[uuid] = entry
+
+    if not dry_run:
+        save_sync_state(output_dir, new_sync_state)
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    parts = [f"{created} created, {updated} updated", f"{skipped} unchanged"]
+    if transcripts_saved:
+        parts.append(f"{transcripts_saved} transcripts saved")
+    print(f"{prefix}Sync complete: {', '.join(parts)}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sync Granola meeting notes to markdown files"
     )
     parser.add_argument(
         "--cache-path",
-        default=DEFAULT_CACHE_PATH,
-        help=f"Path to Granola cache file (default: {DEFAULT_CACHE_PATH})",
+        default=None,
+        help="(Deprecated, ignored) the local cache is no longer used.",
     )
     parser.add_argument(
         "--output-dir",
@@ -949,25 +1323,17 @@ def main():
     parser.add_argument(
         "--no-api",
         action="store_true",
-        help="Skip API calls, use cache only",
+        help="(Deprecated) legacy local-cache mode; the cache is now encrypted "
+             "and unreadable, so this is ignored.",
     )
     args = parser.parse_args()
 
-    if not os.path.exists(args.cache_path):
-        print(f"Error: Cache file not found: {args.cache_path}", file=sys.stderr)
-        _notify_error(
-            f"Cache file not found: {args.cache_path}", args.output_dir
-        )
-        sys.exit(1)
-
     try:
-        sync(
-            cache_path=args.cache_path,
+        sync_via_api(
             output_dir=args.output_dir,
             force=args.force,
             dry_run=args.dry_run,
             verbose=args.verbose,
-            no_api=args.no_api,
         )
     except TransientNetworkError as e:
         print(f"Skipped: {e}", file=sys.stderr)

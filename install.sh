@@ -7,7 +7,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MCP_INSTALL_DIR="$HOME/.local/share/granola-mcp"
 MCP_CONFIG="$HOME/.mcp.json"
-GRANOLA_CACHE="$HOME/Library/Application Support/Granola/cache-v4.json"
 LAUNCHD_LABEL="com.granola-to-markdown.sync"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 
@@ -103,22 +102,42 @@ fi
 ok "git available"
 
 # ---------------------------------------------------------------------------
-# Step 3: Check Granola installed
+# Step 3: Check Granola API key
 # ---------------------------------------------------------------------------
+# The sync pulls from Granola's public API and needs a personal API key
+# (grn_...), provided via the GRANOLA_API_KEY env var or a .granola_api_key
+# file next to sync.py.
 
-info "Checking Granola..."
-if [[ ! -f "$GRANOLA_CACHE" ]]; then
-    error "Granola cache not found at: $GRANOLA_CACHE
+info "Checking Granola API key..."
+KEY_FILE="$SCRIPT_DIR/.granola_api_key"
+if [[ -n "${GRANOLA_API_KEY:-}" ]]; then
+    ok "API key found (GRANOLA_API_KEY env var)"
+elif [[ -f "$KEY_FILE" ]] && grep -q '^grn_' "$KEY_FILE"; then
+    ok "API key found ($KEY_FILE)"
+else
+    error "No Granola API key found.
 
-Install the Granola app from https://granola.ai and attend at least one meeting."
+Create one in the Granola app: Settings -> Connectors -> API keys -> Create new key
+(requires a Business/Enterprise plan). Then provide it one of these ways:
+
+  echo 'grn_your_key_here' > \"$KEY_FILE\"
+    -- or --
+  export GRANOLA_API_KEY=grn_your_key_here
+
+Then re-run ./install.sh"
 fi
-ok "Granola cache found"
 
 # ---------------------------------------------------------------------------
 # Step 4: Optional MCP server setup (uv, GranolaMCP, ~/.mcp.json)
 # ---------------------------------------------------------------------------
 
 if [[ "$WITH_MCP" == "true" ]]; then
+
+    warn "GranolaMCP reads Granola's local cache, which recent Granola versions"
+    warn "(7.42x+) encrypt behind a macOS Keychain key. On affected versions it"
+    warn "may return no data. The markdown export is unaffected (it uses the API)."
+    warn "For interactive search, consider Granola's official MCP server at"
+    warn "https://mcp.granola.ai/mcp instead. Continuing with GranolaMCP setup..."
 
     info "Checking uv..."
     if command -v uv &>/dev/null; then
@@ -254,6 +273,9 @@ echo "  granola-to-markdown installed successfully!"
 echo "-------------------------------------------------------"
 echo ""
 echo "  Meeting notes:   $OUTPUT_DIR"
+if [[ -f "$KEY_FILE" ]]; then
+echo "  API key:         $KEY_FILE"
+fi
 if [[ "$WITH_MCP" == "true" ]]; then
 echo "  MCP config:      $MCP_CONFIG"
 echo "  GranolaMCP:      $MCP_INSTALL_DIR"
