@@ -19,10 +19,12 @@ import argparse
 import base64
 import gzip
 import hashlib
+import http.client
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -51,12 +53,30 @@ class AuthExpiredError(RuntimeError):
 
 
 def _is_transient_network_error(exc):
-    if isinstance(exc, (socket.timeout, ConnectionError, TimeoutError)):
-        return True
+    """True for network conditions a later run is likely to survive.
+
+    Judges the bare exception and the URLError-wrapped one the same way:
+    urllib wraps connect-phase failures, but a failure during resp.read() —
+    after the response headers land — propagates untouched, and the two are
+    the same condition from a retry's point of view.
+    """
     if isinstance(exc, urllib.error.URLError):
-        reason = getattr(exc, "reason", exc)
-        return isinstance(reason, (OSError, socket.timeout, socket.gaierror))
-    return False
+        exc = getattr(exc, "reason", exc)
+    if isinstance(exc, (
+        ssl.SSLCertVerificationError,  # trust/config problem, not a blip
+        gzip.BadGzipFile,              # corrupt body: a decode failure
+        PermissionError,
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+    )):
+        # These are all OSError subclasses that a retry cannot fix. Letting
+        # them through would mean a permanent failure retried quietly every
+        # 30 minutes, with the run exiting 0 and never notifying.
+        return False
+    # socket.timeout, TimeoutError, ConnectionError, socket.gaierror and
+    # ssl.SSLError are all OSError subclasses; IncompleteRead is not.
+    return isinstance(exc, (OSError, http.client.IncompleteRead))
 
 GRANOLA_CACHE_DIR = os.path.expanduser(
     "~/Library/Application Support/Granola"
@@ -176,6 +196,11 @@ DEFAULT_OUTPUT_DIR = os.path.expanduser("~/granola-notes")
 STATE_FILE = ".sync-state.json"
 NOTIFY_STATE_FILE = ".notify-state.json"
 NOTIFY_THROTTLE_SECONDS = 4 * 60 * 60  # don't repeat the same notification within 4h
+# install.sh points launchd's stdout/stderr at $OUTPUT_DIR/.sync.log and passes
+# --verbose, so an unattended install writes ~3 KB per run forever. Trim it.
+LOG_FILE = ".sync.log"
+LOG_MAX_BYTES = 1_000_000
+LOG_KEEP_BYTES = 200_000
 ORPHAN_REMOVAL_MAX_FRACTION = 0.30  # refuse to delete > this fraction of tracked files in one run
 
 
@@ -1016,6 +1041,14 @@ def _api_request(path, key, params=None):
         if _is_transient_network_error(e):
             raise TransientNetworkError(f"Granola API unreachable: {e.reason}")
         raise
+    except (OSError, http.client.HTTPException) as e:
+        # Read-phase failures propagate bare rather than wrapped in URLError:
+        # TimeoutError, ssl.SSLEOFError on a dropped TLS connection, or
+        # IncompleteRead on a truncated body. URLError is an OSError subclass
+        # but is claimed by the clause above, which Python reaches first.
+        if _is_transient_network_error(e):
+            raise TransientNetworkError(f"Granola API unreachable: {e}")
+        raise
 
 
 def fetch_note_list(key, log, page_limit=100):
@@ -1171,118 +1204,134 @@ def sync_via_api(output_dir, force=False, dry_run=False, verbose=False):
         v.get("filename") for v in sync_state.values() if v.get("filename")
     }
 
-    for summ in summaries:
-        note_id = summ.get("id")
-        summ_updated = summ.get("updated_at")
+    completed = False
+    try:
+        for summ in summaries:
+            note_id = summ.get("id")
+            summ_updated = summ.get("updated_at")
 
-        # Fast incremental skip: unchanged since last sync (by note_id).
-        if not force and note_id in note_index:
-            _uuid, prev_updated = note_index[note_id]
-            if prev_updated == summ_updated:
-                skipped += 1
+            # Fast incremental skip: unchanged since last sync (by note_id).
+            if not force and note_id in note_index:
+                _uuid, prev_updated = note_index[note_id]
+                if prev_updated == summ_updated:
+                    skipped += 1
+                    continue
+
+            try:
+                note = fetch_note_detail(key, note_id)
+            except (TransientNetworkError, AuthExpiredError):
+                raise
+            except Exception as ex:
+                log(f"  skip {note_id}: detail fetch failed: {ex}")
                 continue
 
-        try:
-            note = fetch_note_detail(key, note_id)
-        except (TransientNetworkError, AuthExpiredError):
-            raise
-        except Exception as ex:
-            log(f"  skip {note_id}: detail fetch failed: {ex}")
-            continue
+            data = api_note_to_data(note)
+            uuid = data["id"]
+            prev = sync_state.get(uuid, {})
+            slug = slugify(data["title"]) or "untitled"
 
-        data = api_note_to_data(note)
-        uuid = data["id"]
-        prev = sync_state.get(uuid, {})
-        slug = slugify(data["title"]) or "untitled"
+            # Preserve an existing .md when content is unchanged. This is the
+            # first-run migration case (prior state has no note_id, so the fast
+            # skip above misses): don't rewrite the file — it may contain the
+            # user's hand-typed ## Notes the API can't return — just backfill
+            # note_id and any missing transcript.
+            content_unchanged = (
+                not force
+                and prev.get("filename")
+                and prev.get("updated_at") == data["updated_at"]
+            )
 
-        # Preserve an existing .md when content is unchanged. This is the
-        # first-run migration case (prior state has no note_id, so the fast
-        # skip above misses): don't rewrite the file — it may contain the
-        # user's hand-typed ## Notes the API can't return — just backfill
-        # note_id and any missing transcript.
-        content_unchanged = (
-            not force
-            and prev.get("filename")
-            and prev.get("updated_at") == data["updated_at"]
-        )
+            entry = dict(prev)
+            entry["note_id"] = note_id
+            entry["updated_at"] = data["updated_at"]
 
-        entry = dict(prev)
-        entry["note_id"] = note_id
-        entry["updated_at"] = data["updated_at"]
-
-        if content_unchanged:
-            skipped += 1
-            filename = prev["filename"]
-        else:
-            filename = prev.get("filename")
-            if not filename:
-                filename = f"{data['date']}_{slug}.md"
-                if filename in used_filenames:
-                    filename = f"{data['date']}_{slug}_{uuid[:8]}.md"
-            # Recover the user's hand-typed ## Notes from the existing file
-            # (the API can't return them) so a summary refresh preserves them.
-            old_filename = prev.get("filename")
-            if old_filename and not data["notes"]:
-                recovered = read_existing_user_notes(
-                    os.path.join(output_dir, old_filename)
-                )
-                if recovered:
-                    data["notes"] = recovered
-            # Rename detection (title/date changed).
-            if old_filename and old_filename != filename:
-                old_path = os.path.join(output_dir, old_filename)
-                if os.path.exists(old_path) and not dry_run:
-                    os.remove(old_path)
-
-            filepath = os.path.join(output_dir, filename)
-            content = build_markdown(data)
-            if dry_run:
-                log(f"  Would {'update' if prev else 'create'}: {filename}")
+            if content_unchanged:
+                skipped += 1
+                filename = prev["filename"]
             else:
-                with open(filepath, "w") as f:
-                    f.write(content)
-            if prev:
-                updated += 1
-                log(f"  Updated: {filename}")
+                filename = prev.get("filename")
+                if not filename:
+                    filename = f"{data['date']}_{slug}.md"
+                    if filename in used_filenames:
+                        filename = f"{data['date']}_{slug}_{uuid[:8]}.md"
+                # Recover the user's hand-typed ## Notes from the existing file
+                # (the API can't return them) so a summary refresh preserves them.
+                old_filename = prev.get("filename")
+                if old_filename and not data["notes"]:
+                    recovered = read_existing_user_notes(
+                        os.path.join(output_dir, old_filename)
+                    )
+                    if recovered:
+                        data["notes"] = recovered
+                # Rename detection (title/date changed).
+                if old_filename and old_filename != filename:
+                    old_path = os.path.join(output_dir, old_filename)
+                    if os.path.exists(old_path) and not dry_run:
+                        os.remove(old_path)
+
+                filepath = os.path.join(output_dir, filename)
+                content = build_markdown(data)
+                if dry_run:
+                    log(f"  Would {'update' if prev else 'create'}: {filename}")
+                else:
+                    with open(filepath, "w") as f:
+                        f.write(content)
+                if prev:
+                    updated += 1
+                    log(f"  Updated: {filename}")
+                else:
+                    created += 1
+                    log(f"  Created: {filename}")
+                entry["filename"] = filename
+
+            used_filenames.add(filename)
+
+            # Save transcript once (backfills notes that never had one before).
+            utterances = api_transcript_utterances(note)
+            if utterances and not entry.get("transcript_saved"):
+                transcript_filename = f"{data['date']}_{slug}_transcript.md"
+                transcript_path = os.path.join(output_dir, transcript_filename)
+                transcript_md = format_transcript(utterances)
+                if dry_run:
+                    log(
+                        f"  Would save transcript: {transcript_filename} "
+                        f"({len(utterances)} utterances)"
+                    )
+                else:
+                    with open(transcript_path, "w") as f:
+                        f.write(f'---\ntitle: "{data["title"]} — Transcript"\n')
+                        f.write(f"date: {data['date']}\n")
+                        f.write(f"granola_id: {uuid}\n")
+                        f.write("type: transcript\n---\n\n")
+                        f.write(f"# {data['title']} — Transcript\n\n")
+                        f.write(transcript_md)
+                        f.write("\n")
+                    log(
+                        f"  Saved transcript: {transcript_filename} "
+                        f"({len(utterances)} utterances)"
+                    )
+                entry["transcript_saved"] = True
+                entry["transcript_filename"] = transcript_filename
+                transcripts_saved += 1
+
+            new_sync_state[uuid] = entry
+        completed = True
+    finally:
+        # An abort partway through (a transient network error inside the
+        # loop) must not discard the notes already written this run. But
+        # new_sync_state is only a superset of the state file when
+        # force=False; under --force it starts EMPTY, and writing that over
+        # a good state file would strand every note's filename and
+        # transcript flag — the next run would then overwrite those files
+        # with an empty ## Notes section. So merge on the abort path, and
+        # only replace wholesale once the loop has actually finished.
+        if not dry_run:
+            if completed:
+                save_sync_state(output_dir, new_sync_state)
             else:
-                created += 1
-                log(f"  Created: {filename}")
-            entry["filename"] = filename
-
-        used_filenames.add(filename)
-
-        # Save transcript once (backfills notes that never had one before).
-        utterances = api_transcript_utterances(note)
-        if utterances and not entry.get("transcript_saved"):
-            transcript_filename = f"{data['date']}_{slug}_transcript.md"
-            transcript_path = os.path.join(output_dir, transcript_filename)
-            transcript_md = format_transcript(utterances)
-            if dry_run:
-                log(
-                    f"  Would save transcript: {transcript_filename} "
-                    f"({len(utterances)} utterances)"
-                )
-            else:
-                with open(transcript_path, "w") as f:
-                    f.write(f'---\ntitle: "{data["title"]} — Transcript"\n')
-                    f.write(f"date: {data['date']}\n")
-                    f.write(f"granola_id: {uuid}\n")
-                    f.write("type: transcript\n---\n\n")
-                    f.write(f"# {data['title']} — Transcript\n\n")
-                    f.write(transcript_md)
-                    f.write("\n")
-                log(
-                    f"  Saved transcript: {transcript_filename} "
-                    f"({len(utterances)} utterances)"
-                )
-            entry["transcript_saved"] = True
-            entry["transcript_filename"] = transcript_filename
-            transcripts_saved += 1
-
-        new_sync_state[uuid] = entry
-
-    if not dry_run:
-        save_sync_state(output_dir, new_sync_state)
+                merged = load_sync_state(output_dir)
+                merged.update(new_sync_state)
+                save_sync_state(output_dir, merged)
 
     prefix = "[DRY RUN] " if dry_run else ""
     parts = [f"{created} created, {updated} updated", f"{skipped} unchanged"]
@@ -1327,6 +1376,9 @@ def main():
              "and unreadable, so this is ignored.",
     )
     args = parser.parse_args()
+    if not args.dry_run:
+        # --dry-run promises to write nothing; trimming the log is a write.
+        _trim_log(args.output_dir)
 
     try:
         sync_via_api(
@@ -1349,6 +1401,39 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         _notify_error(str(e), args.output_dir)
         sys.exit(1)
+
+
+def _trim_log(output_dir):
+    """Keep the launchd log bounded, discarding the oldest lines.
+
+    Truncates in place rather than renaming: launchd opens StandardOutPath once
+    per run and this process already holds that descriptor, so a rename would
+    send the rest of this run's output to the rotated file and leave the live
+    log empty. Rewriting the same inode is safe because launchd opens it
+    O_APPEND — writes still land at the current end. Called before this run
+    prints anything, so nothing of its own is lost. Best-effort throughout:
+    logging must never be the reason a sync fails.
+    """
+    path = os.path.join(output_dir, LOG_FILE)
+    try:
+        size = os.path.getsize(path)
+        if size <= LOG_MAX_BYTES:
+            return
+        with open(path, "rb") as f:
+            f.seek(-min(LOG_KEEP_BYTES, size), os.SEEK_END)
+            tail = f.read()
+        # Drop the partial first line so the log starts cleanly — unless the
+        # tail holds no newline at all, in which case there is no partial line
+        # to drop and cutting at the first one would discard everything.
+        if b"\n" in tail:
+            tail = tail.partition(b"\n")[2]
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header = f"--- log trimmed to last {LOG_KEEP_BYTES // 1000} KB at {stamp} ---\n"
+        with open(path, "wb") as f:
+            f.write(header.encode("utf-8"))
+            f.write(tail)
+    except OSError:
+        return
 
 
 def _notify_error(message, output_dir=None):
