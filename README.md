@@ -102,7 +102,7 @@ To sync every 30 minutes in the background:
 ./install.sh --with-launchd
 ```
 
-This installs a macOS launchd agent that runs the sync script automatically. Logs go to `~/granola-notes/.sync.log`.
+This installs a macOS launchd agent that runs the sync script automatically. Logs go to `~/granola-notes/.sync.log`. Once that file passes 1 MB, the next run trims it to its most recent 200 KB — older lines are discarded, so copy anything you need to keep.
 
 The launchd agent reads your API key from the `.granola_api_key` **file** (it doesn't inherit your shell's `GRANOLA_API_KEY` env var), so make sure that file exists for background sync to work.
 
@@ -194,7 +194,7 @@ This removes the MCP server config (if installed), GranolaMCP, and launchd agent
 
 **Sync shows "0 created, 0 updated"** — Your meetings are already exported. Use `--force` to re-export everything.
 
-**Missing meetings** — The API only returns notes that have a generated AI summary and transcript, so a meeting that was never processed by Granola won't appear. Otherwise the API serves your full history, regardless of age.
+**Missing meetings** — The API only returns notes that have a generated AI summary, so a meeting that was never processed by Granola won't appear. A missing transcript is not a reason for a note to be skipped — those notes sync fine, just without a `_transcript.md` companion. Otherwise the API serves your full history, regardless of age.
 
 **Sync skipped: network error** — The API was temporarily unreachable (or rate-limited). The run exits cleanly with existing notes preserved; the next scheduled run retries automatically.
 
